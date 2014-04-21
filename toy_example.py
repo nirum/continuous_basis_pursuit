@@ -36,15 +36,15 @@ def cbp_taylor(y, F, Delta, penalty=0.1, order=1):
         current = dF[-1]
 
     # Construct the problem.
-    Fcp = cvxopt.matrix(F)
-    dFcp = cvxopt.matrix(dF[0])
-    ycp = cvxopt.matrix(y)
+    Fp = cvxopt.matrix(F)
+    dFp = cvxopt.matrix(dF[0])
+    yp = cvxopt.matrix(y)
     gamma = cp.Parameter(sign="positive", name='gamma')
     gamma.value = penalty
 
     x = cp.Variable(F.shape[1],name='x')
     d = cp.Variable(F.shape[1],name='d')
-    objective = cp.Minimize(sum(cp.square(ycp - Fcp*x - dFcp*d)) + gamma*cp.norm(x, 1))
+    objective = cp.Minimize(sum(cp.square(yp - Fp*x - dFp*d)) + gamma*cp.norm(x, 1))
     constraints = [0 <= x, cp.abs(d) <= 0.5*Delta*x]
     p = cp.Problem(objective, constraints)
 
@@ -55,6 +55,59 @@ def cbp_taylor(y, F, Delta, penalty=0.1, order=1):
     yhat = F.dot(np.array(x.value)) + dF[0].dot(np.array(d.value))
 
     return np.array(x.value), yhat, np.array(d.value), p.value
+
+def cbp_polar(y, F, Fprev, Fnext, Delta, penalty=0.1, order=1):
+    """
+    CBP with polar interpolation
+    """
+
+    # compute r and theta
+    a = 0.5 * np.linalg.norm(Fnext-Fprev, axis=0)[int(F.shape[1]/2)]
+    b = np.linalg.norm(F-Fprev, axis=0)[int(F.shape[1]/2)]
+    theta = np.pi - 2 * np.arcsin(a/b)      # radians
+    r = a / np.sin(theta)
+
+    # build the polar transformation matrix
+    P = np.array([[1,r*np.cos(theta),-r*np.sin(theta)], [1,r,0], [1,r*np.cos(theta),r*np.sin(theta)]])
+
+    # get C, U, and V
+    pol = np.linalg.inv(P).dot(np.vstack((Fprev.ravel(),F.ravel(),Fnext.ravel())))
+    C = pol[0,:].reshape(F.shape)
+    U = pol[1,:].reshape(F.shape)
+    V = pol[2,:].reshape(F.shape)
+
+    ## construct the problem
+
+    # discretized matrices
+    Cp = cvxopt.matrix(C)
+    Up = cvxopt.matrix(U)
+    Vp = cvxopt.matrix(V)
+    yp = cvxopt.matrix(y)
+
+    # sparsity penalty
+    gamma = cp.Parameter(sign="positive", name='gamma')
+    gamma.value = penalty
+
+    # variables
+    dx = cp.Variable(F.shape[1],name='x')
+    dy = cp.Variable(F.shape[1],name='y')
+    dz = cp.Variable(F.shape[1],name='z')
+
+    # objective and constraints
+    objective = cp.Minimize(sum(cp.square(yp - Cp*dx - Up*dy - Vp*dz)) + gamma*cp.norm(dx, 1))
+    #constraints = [0 <= x, cp.sqrt(cp.square(y)+cp.square(z)) <= r*x, r*np.cos(theta)*x <= y, y <= r*x]
+    sqcon = [cp.norm(cp.vstack(yi,zi),2) <= xi*r for xi, yi, zi in zip(dx,dy,dz)]
+    constraints = [0 <= dx, dy <= r*dx, r*np.cos(theta)*dx <= dy]
+    constraints.extend(sqcon)
+    p = cp.Problem(objective, constraints)
+
+    # solve
+    result = p.solve()
+
+    # reconstruct
+    yhat = C.dot(np.array(dx.value)) + U.dot(np.array(dy.value)) + V.dot(np.array(dz.value))
+
+    return np.array(dx.value), yhat, p.value
 
 def basisfun(t,tau,sigma):
     """
@@ -77,7 +130,7 @@ if __name__ == "__main__":
     # pick a basis function
     m = 25
     sigma = 5
-    t = np.linspace(-10,10,m)
+    t = np.linspace(-25,25,m)
     f = basisfun(t, 0, sigma)
 
     # pick a time shift
@@ -88,20 +141,26 @@ if __name__ == "__main__":
     y = basisfun(t,tau,sigma) + eta * np.random.randn(t.size)
 
     # number of copies
-    N = 5
-    delta = np.linspace(t.min(),t.max(),N)
+    N = 4
+    spacings = np.linspace(t.min()+10,t.max()-10,N)
+    delta = np.mean(np.diff(spacings))
 
     # build the dictionary
-    F = np.vstack([basisfun(t,d,sigma) for d in delta]).T
+    F = np.vstack([basisfun(t,d,sigma) for d in spacings]).T
+
+    # half-spacings for polar interpolation
+    Fprev = np.vstack([basisfun(t,d-delta/2.0,sigma) for d in spacings]).T
+    Fnext = np.vstack([basisfun(t,d+delta/2.0,sigma) for d in spacings]).T
 
     # run basis pursuit
-    xhat_bp, yhat_bp = basispursuit(y, F, penalty=0.1)
+    xhat_bp, yhat_bp = basispursuit(y, F, penalty=0.01)
 
     # run 1st order taylor approximation
-    xhat_taylor, yhat_taylor, dhat_taylor, objval = cbp_taylor(y, F, np.mean(np.diff(delta)), penalty=0.1)
-    #dF = cbp_taylor(y, F, penalty=0.1)
-    #print dF
+    xhat_taylor, yhat_taylor, dhat_taylor, objval_taylor = cbp_taylor(y, F, delta, penalty=0.1)
+
+    # run polar interpolation
+    xhat_polar, yhat_polar, objval_polar = cbp_polar(y, F, Fprev, Fnext, delta, penalty=0.1)
 
     plt.figure()
-    plt.plot(t,y,'k-', t, yhat_bp, 'b--', t, yhat_taylor, 'r--')
+    plt.plot(t,y,'k-', t, yhat_bp, 'b--', t, yhat_taylor, 'r--', t, yhat_polar, 'g--')
     plt.show()
